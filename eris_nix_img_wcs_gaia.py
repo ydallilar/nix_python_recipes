@@ -49,10 +49,12 @@ def wcs_sf(sources, ra_f, dec_f, ang, pxscl, sign):
     res = np.zeros((len(sources), 2))
     
     pix_off = xy - crpix
-    pix_off[:,0] /= (np.cos(np.deg2rad(sources["GDEC"])))
+    #pix_off[:,0] /= (np.cos(np.deg2rad(sources["DEC"])))
     
     for i in range(len(sources)):
-        res[i,:] = np.matmul(cd, pix_off[i,:]) + crval
+        res[i,:] = np.matmul(cd, pix_off[i,:])
+        res[i,0] /= (np.cos(np.deg2rad(sources["DEC"][i]))) 
+        res[i,:] += crval
 
     return res
 
@@ -64,7 +66,7 @@ def wcserr_sf(p, sources, sign):
 
 class GAIAProd:
 
-    gaia_cols = ["Source", "RA_ICRS", "e_RA_ICRS", "DE_ICRS", "e_DE_ICRS", "Gmag"]
+    gaia_cols = ["Source", "RA_ICRS", "e_RA_ICRS", "DE_ICRS", "e_DE_ICRS", "Gmag", "pmRA", "pmDE"]
     gaia_fmt = ["A30", "D", "D", "D", "D", "D", "D", "D"]
     
     def __init__(self, coo, date, params):
@@ -81,10 +83,9 @@ class GAIAProd:
             warnings.simplefilter('ignore', AstropyWarning)
             result = Vizier.query_region(self.coo, width=box_width, catalog="I/350/gaiaedr3", column_filters={'Gmag': '<%.f' % maglim})
         gaia_table = result[0][tuple(self.gaia_cols)]
-        #if prop_motion:
-        #    gaia_table["RA_ICRS"] += (gaia_table["pmRA"]*(self.date-57388.)*1e-3/60./60./365.)
-        #    gaia_table["DE_ICRS"] += (gaia_table["pmDE"]*(self.date-57388.)*1e-3/60./60./365.)
-        #print(gaia_table["DE_ICRS"])
+        if prop_motion:
+            gaia_table["RA_ICRS"] += (gaia_table["pmRA"]*(self.date-57388.)/np.cos(np.deg2rad(gaia_table["DE_ICRS"]))*1e-3/60./60./365.25)
+            gaia_table["DE_ICRS"] += (gaia_table["pmDE"]*(self.date-57388.)*1e-3/60./60./365.25)
         cols = [fits.Column(name=name, format=fmt, array=gaia_table[name]) for name, fmt in zip(self.gaia_cols, self.gaia_fmt)]
         self.catalog = fits.BinTableHDU.from_columns(cols)
 
@@ -293,7 +294,7 @@ class NIXFrame(Frame):
 
             #print(np.stack([self.sources["x"], self.sources["y"], self.sources["GRA"], self.sources["GDEC"]], axis=1))
             
-            print(len(self.sources.data))
+            #print(len(self.sources.data))
             if len(self.sources.data) > 4:
                 out = leastsq(wcserr_sf, x0=[self.hdul[1].header["CRVAL1"], 
                                         self.hdul[1].header["CRVAL2"], 
@@ -322,13 +323,17 @@ class NIXFrame(Frame):
                 logger.warning("Not enough matched sources. Skipping...")
                 break
 
+        return out[0][0], out[0][1], PA, pxscl, np.mean(err), np.std(err)
+
     def process(self):
         coo = self.gaia_prod.relative_offset(self.hdul[1].data)
         self.hdul[1].header["CRVAL1"] = coo.ra.value
         self.hdul[1].header["CRVAL2"] = coo.dec.value
         self.hdul[1].header["CRPIX1"] = 1023.5
         self.hdul[1].header["CRPIX2"] = 1023.5
-        self.solve_wcs()
+        res = self.solve_wcs()
+
+        return res
 
 class TestRecipe(esorexplugin.RecipePlugin):
 
@@ -345,16 +350,27 @@ class TestRecipe(esorexplugin.RecipePlugin):
 
     #copyright = EsoCopyright("TEST_INSTRUMENT", [2010, 2013, 2014, 2015, 2017])
 
+    ENV_ENABLED=False
+
     parameters = [
-            ValueParameter("gaia.maglim", 20.),
-            ValueParameter("gaia.prop_motion", False),
-            ValueParameter("gaia.fwhm", 0.25),
-            ValueParameter("gaia.zeromag", 20.),
-            ValueParameter("gaia.min_separation", 0.3),
-            ValueParameter("sep.thresh", 10.),
-            ValueParameter("sep.min_separation", 1.),
-            ValueParameter("nix.saturation_level", 15e3),
-            ValueParameter("nix.frame_cut", 900.),
+            ValueParameter("gaia.maglim", 20.,
+                description="Magnitude cut to GAIA catalog", env_enabled=ENV_ENABLED),
+            ValueParameter("gaia.prop_motion", False,
+                description="Enable GAIA proper motions (seems to not help whole a lot)", env_enabled=ENV_ENABLED),
+            ValueParameter("gaia.fwhm", 0.25,
+                description="FWHM of sources in GAIA mock image", env_enabled=ENV_ENABLED),
+            ValueParameter("gaia.zeromag", 20.,
+                description="Zero magnitude of GAIA mock image (shouldn't affect things)", env_enabled=ENV_ENABLED),
+            ValueParameter("gaia.min_separation", 0.3,
+                description="Maximum angular distance to allow cross-matching", env_enabled=ENV_ENABLED),
+            ValueParameter("sep.thresh", 10.,
+                description="Source detection threshold for sep in units of background sigma", env_enabled=ENV_ENABLED),
+            ValueParameter("sep.min_separation", 1.,
+                description="Ignore sources closer than this angular distance", env_enabled=ENV_ENABLED),
+            ValueParameter("nix.saturation_level", 15e3,
+                description="Saturation level. This is scaled by 1./DIT as images are in adu/s", env_enabled=ENV_ENABLED),
+            ValueParameter("nix.frame_cut", 900.,
+                description="This is a simple workaround to avoid frame edges. 1024-nix.frame_cut pixels will be cropped as a frame.", env_enabled=ENV_ENABLED),
         ]
     
     # No clue what this is
@@ -378,18 +394,34 @@ class TestRecipe(esorexplugin.RecipePlugin):
 
     def process(self, frames, *args):
 
+        out_cols = ["RA", "DEC", "PA", "PXSCL", "MEAN_UNC", "STD_UNC"]
+
         params = dict_params(self.input_parameters)
         FrameStore = []
+        res = np.recarray((len(frames),), dtype=[(col, float) for col in out_cols])
 
         output_frames = []
-        for frame in frames:
+        for i, frame in enumerate(frames):
             nxframe = NIXFrame(frame, params)
-            nxframe.process()
+            res[i] = nxframe.process()
             FrameStore.append(nxframe)
             new_frame = Frame("%s" % nxframe.frame.filename.split("/")[-1], "PROD", type = Frame.TYPE_IMAGE)
             output_frames.append(new_frame)
         
+
         for output, frame in zip(output_frames, FrameStore):
             output.write(frame.hdul, overwrite=True)
+        
+        hdu = fits.BinTableHDU.from_columns(
+                fits.ColDefs([fits.Column(name=col, array=res[col], format="D") for col in out_cols]))
+        hdu.header["PXSCL"] = np.mean(res["PXSCL"])
+        hdu.header["EPXSCL"] = np.std(res["PXSCL"])
+        hdu.header["PA"] = np.mean(res["PA"])
+        hdu.header["EPA"] = np.std(res["PA"])
+
+        table = Frame("WCS_fit_result.fits", "PROD", type=Frame.TYPE_TABLE)
+        output_frames.append(table)
+        output_frames[-1].write(hdu, overwrite=True)
 
         return output_frames
+
