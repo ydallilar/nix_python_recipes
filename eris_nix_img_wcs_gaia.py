@@ -163,13 +163,15 @@ class GAIAProd:
 
 class NIXFrame(Frame):
 
+    result = None
+
     def __init__(self, frame, params):
         logger.info("Processing : %s" % frame.filename)
         self.frame = frame
         self.params = params
         self.hdul = self.frame.open()
         self.patch_wcs_if_needed()
-        self.setup_gaia()
+        #self.setup_gaia()
     
     # This is useless since the recipes like to edit RA and DEC...
     def patch_wcs_if_needed(self):
@@ -245,6 +247,20 @@ class NIXFrame(Frame):
             if np.any((0 < d) & (d < min_sep/60./60.)): ndx.append(i)
         
         return np.delete(sources, ndx)
+
+    def xy_to_ra_dec(self, ndx, crpix=[1023.5, 1023.5]):
+
+        cdu = np.array([[self.sign, 0], [0, 1]])
+        cd = np.matmul(rotM(self.result["PA"]), cdu)*self.result["pxscl"]*1e-3/60/60.
+
+        #print(np.array([self.sources[ndx]["x"], self.sources[ndx]["y"]]))
+        xy = np.array([self.sources[ndx]["x"], self.sources[ndx]["y"]]) - np.array(crpix)
+
+        coo = np.matmul(cd, xy)
+        coo[0] /= np.cos(np.deg2rad(self.result["DEC"]))
+        coo[:] += np.array([self.result["RA"], self.result["DEC"]])
+        #print(coo, self.sources[ndx]["RA"], self.sources[ndx]["DEC"])
+        return(coo)
 
     def add_ra_dec(self, sources):
     
@@ -323,9 +339,11 @@ class NIXFrame(Frame):
                 logger.warning("Not enough matched sources. Skipping...")
                 break
 
+        self.result = {"RA" : out[0][0], "DEC" : out[0][1], "PA" : PA, "pxscl" : pxscl}
         return out[0][0], out[0][1], PA, pxscl, np.mean(err), np.std(err)
 
     def process(self):
+        self.setup_gaia()
         coo = self.gaia_prod.relative_offset(self.hdul[1].data)
         self.hdul[1].header["CRVAL1"] = coo.ra.value
         self.hdul[1].header["CRVAL2"] = coo.dec.value
@@ -334,6 +352,95 @@ class NIXFrame(Frame):
         res = self.solve_wcs()
 
         return res
+
+class InternalMatch:
+
+    def __init__(self, FrameStore):
+        self.FrameStore = FrameStore
+        for frame in self.FrameStore:
+            frame.extract_sources(1)
+            frame.sources = rfn.append_fields(frame.sources, ["MATCH"], [np.zeros(len(frame.sources)).astype(int)])
+        self.do_master_catalog()
+
+    def check_frames(self, src, st):
+
+        matches = []
+
+        for i in range(st, len(self.FrameStore)):
+            ndx = np.where(np.sqrt(((src["RA"]-self.FrameStore[i].sources["RA"])*np.cos(np.deg2rad(src["DEC"])))**2 + \
+                            (src["DEC"]-self.FrameStore[i].sources["DEC"])**2) < 0.5/60./60.)[0]
+            if len(ndx) == 1:
+                self.FrameStore[i].sources[ndx[0]]["MATCH"] = 1
+                matches.append((i, ndx[0]))
+
+        return matches
+
+    def do_master_catalog(self):
+        self.catalog = []
+
+        for i in range(len(self.FrameStore)-1):
+            for j, source in enumerate(self.FrameStore[i].sources):
+                if source["MATCH"] == 0:
+                    matches = self.check_frames(source, i+1)
+                    if len(matches) > 0:
+                        self.catalog.append([[source["RA"], source["DEC"]], (i,j), *matches])
+
+        for i, source in enumerate(self.catalog):
+            self.err_sf(i)
+
+    def err_sf(self, ndx):
+        matches = self.catalog[ndx][1:]
+        coo = np.zeros([len(matches),2])
+
+        for i, match in enumerate(matches):
+            frame = self.FrameStore[match[0]]
+            coo[i,:] = frame.xy_to_ra_dec(match[1])
+            
+        res_std = np.std(coo, axis=0)
+        res_mean = np.mean(coo, axis=0)
+    
+        return np.sqrt((res_std[0]/np.cos(np.deg2rad(res_mean[1])))**2 + res_std[1]**2)
+
+    def err_f(self, p):
+
+        sz = len(self.FrameStore)
+
+        for i, frame in enumerate(self.FrameStore):
+            frame.result = {"RA" : p[2+i], "DEC" : p[2+sz+i], "PA" : p[0], "pxscl" : p[1]}
+
+        sz = len(self.catalog)
+        err = np.array([self.err_sf(i) for i in range(sz)])
+
+        return err
+
+    def refine(self):
+
+        logging.info("Drizzling sources...")
+
+        pa = self.FrameStore[0].result["PA"]
+        pxscl = self.FrameStore[0].result["pxscl"]
+        RAs = np.array([frame.result["RA"] for frame in self.FrameStore])
+        DECs = np.array([frame.result["DEC"] for frame in self.FrameStore])
+
+        out = leastsq(self.err_f, x0=[pa, pxscl, *RAs, *DECs])
+        sz = len(self.FrameStore)
+
+        for i, frame in enumerate(self.FrameStore):
+            
+            cdu = np.array([[frame.sign, 0], [0, 1]])*out[0][1]*1e-3/60./60
+            cd = np.matmul(rotM(out[0][0]), cdu)
+
+            frame.hdul[1].header["CRVAL1"] = out[0][2+i]
+            frame.hdul[1].header["CRVAL2"] = out[0][2+sz+i]
+            frame.hdul[1].header["CRPIX1"] = 1023.5
+            frame.hdul[1].header["CRPIX2"] = 1023.5
+            frame.hdul[1].header["CD1_1"] = cd[0][0] 
+            frame.hdul[1].header["CD1_2"] = cd[0][1] 
+            frame.hdul[1].header["CD2_1"] = cd[1][0] 
+            frame.hdul[1].header["CD2_2"] = cd[1][1] 
+
+
+        print(out)
 
 class TestRecipe(esorexplugin.RecipePlugin):
 
@@ -371,6 +478,8 @@ class TestRecipe(esorexplugin.RecipePlugin):
                 description="Saturation level. This is scaled by 1./DIT as images are in adu/s", env_enabled=ENV_ENABLED),
             ValueParameter("nix.frame_cut", 900.,
                 description="This is a simple workaround to avoid frame edges. 1024-nix.frame_cut pixels will be cropped as a frame.", env_enabled=ENV_ENABLED),
+            ValueParameter("nix.drizzle", False,
+                description="Experimental. At the end, the algorithm fixes the PA and pixel scale and does internal cross-matching of sources. Though this does break GAIA matching.", env_enabled=ENV_ENABLED),
         ]
     
     # No clue what this is
@@ -407,7 +516,9 @@ class TestRecipe(esorexplugin.RecipePlugin):
             FrameStore.append(nxframe)
             new_frame = Frame("%s" % nxframe.frame.filename.split("/")[-1], "PROD", type = Frame.TYPE_IMAGE)
             output_frames.append(new_frame)
-        
+ 
+        if drizzle:
+            InternalMatch(FrameStore).refine()
 
         for output, frame in zip(output_frames, FrameStore):
             output.write(frame.hdul, overwrite=True)
