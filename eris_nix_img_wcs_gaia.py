@@ -64,6 +64,56 @@ def wcserr_sf(p, sources, sign):
     n_coo = wcs_sf(sources, p[0], p[1], p[2], p[3], sign)
     return np.sqrt(((g_coo[:,0]-n_coo[:,0])*(np.cos(np.deg2rad(g_coo[:,1]))))**2+(g_coo[:,1]-n_coo[:,1])**2)
 
+def err_off(p, calcd, reqd):
+
+    scl = p[1]
+    ang = p[0]
+
+    sz = calcd.shape[0]
+    res = np.zeros([sz, 2])
+
+    for i in range(sz):
+        res[i,:] = calcd[i,:] - scl*np.matmul(rotM(ang), reqd[i,:])
+
+    return np.sqrt((res[:,0])**2+(res[:,1])**2)
+
+def calc_off(p, calcd):
+
+    scl = p[1]
+    ang = p[0]
+
+    sz = calcd.shape[0]
+    res = np.zeros([sz, 2])
+
+    for i in range(sz):
+        res[i,:] = np.matmul(np.linalg.inv(rotM(ang)), calcd[i,:])/scl
+
+    return res
+
+def offset_analysis(frameStore, user_off, origin):
+
+    mes_off = np.zeros([len(frameStore), 2])
+    est_off = np.zeros([len(frameStore), 2])
+
+    print(mes_off.shape, est_off.shape, user_off.shape)
+
+    for i, frame in enumerate(frameStore):
+        wcs_t = frame.result
+        if i == 0:
+            wcs_p = frameStore[origin].result
+        else:
+            wcs_p = frameStore[i-1].result
+        mes_off[i,:] = [(wcs_t["RA"]-wcs_p["RA"])*np.cos(np.deg2rad(wcs_p["DEC"]))*60*60, (wcs_t["DEC"]-wcs_p["DEC"])*60*60]
+
+    out = leastsq(err_off, x0=[0., 1.], args=(mes_off, user_off))
+
+    est_off = calc_off(out[0], mes_off)
+        
+    print(out[0][0], out[0][1])
+    print(mes_off, est_off)
+
+    return {"OffAngle" : out[0][0], "OffScale" : out[0][1]}, mes_off, est_off
+
 class GAIAProd:
 
     gaia_cols = ["Source", "RA_ICRS", "e_RA_ICRS", "DE_ICRS", "e_DE_ICRS", "Gmag", "pmRA", "pmDE"]
@@ -439,8 +489,7 @@ class InternalMatch:
             frame.hdul[1].header["CD2_1"] = cd[1][0] 
             frame.hdul[1].header["CD2_2"] = cd[1][1] 
 
-
-        print(out)
+        return {"PA" : out[0][0], "pxscl" : out[0][1], "RA" : out[0][2:2+sz], "DEC" : out[0][2+sz:2+2*sz]}
 
 class TestRecipe(esorexplugin.RecipePlugin):
 
@@ -480,6 +529,8 @@ class TestRecipe(esorexplugin.RecipePlugin):
                 description="This is a simple workaround to avoid frame edges. 1024-nix.frame_cut pixels will be cropped as a frame.", env_enabled=ENV_ENABLED),
             ValueParameter("nix.drizzle", False,
                 description="Experimental. At the end, the algorithm fixes the PA and pixel scale and does internal cross-matching of sources. Though this does break GAIA matching.", env_enabled=ENV_ENABLED),
+            ValueParameter("nix.origin", 12,
+                description="", env_enabled=ENV_ENABLED),
         ]
     
     # No clue what this is
@@ -503,9 +554,24 @@ class TestRecipe(esorexplugin.RecipePlugin):
 
     def process(self, frames, *args):
 
-        out_cols = ["RA", "DEC", "PA", "PXSCL", "MEAN_UNC", "STD_UNC"]
 
         params = dict_params(self.input_parameters)
+        drizzle = params["nix.drizzle"]
+        origin = params["nix.origin"]
+
+        # See if user offset given
+        match = [i for i, frame in enumerate(frames) if frame.tag == "USER_OFFSET"]
+        if  len(match) == 1:
+            userf = frames.pop(match[0])
+            user_off = np.loadtxt(userf.filename)
+            #user_off = np.cumsum(user_off, axis=0)
+            USER_OFF_ENABLED = True
+            logger.info("Using user offsets provided from: %s. Will provide offset analysis." % userf.filename)
+        else:
+            USER_OFF_ENABLED = False
+
+        out_cols = ["RA", "DEC", "PA", "PXSCL", "MEAN_UNC", "STD_UNC"]
+        
         FrameStore = []
         res = np.recarray((len(frames),), dtype=[(col, float) for col in out_cols])
 
@@ -517,22 +583,54 @@ class TestRecipe(esorexplugin.RecipePlugin):
             new_frame = Frame("%s" % nxframe.frame.filename.split("/")[-1], "PROD", type = Frame.TYPE_IMAGE)
             output_frames.append(new_frame)
  
-        if drizzle:
-            InternalMatch(FrameStore).refine()
-
-        for output, frame in zip(output_frames, FrameStore):
-            output.write(frame.hdul, overwrite=True)
-        
+        if USER_OFF_ENABLED:
+            res_off = offset_analysis(FrameStore, user_off, origin)
+            res = rfn.append_fields(res, ["WCS_RA_OFF", "WCS_DEC_OFF", "USER_RA_OFF", "USER_DEC_OFF", "EST_RA_OFF", "EST_DEC_OFF"], 
+                    [res_off[1][:,0], res_off[1][:,1], user_off[:,0], user_off[:,1], res_off[2][:,0], res_off[2][:,1]])
+         
         hdu = fits.BinTableHDU.from_columns(
-                fits.ColDefs([fits.Column(name=col, array=res[col], format="D") for col in out_cols]))
+                fits.ColDefs([fits.Column(name=col, array=res[col], format="D") for col in res.dtype.names]))
         hdu.header["PXSCL"] = np.mean(res["PXSCL"])
         hdu.header["EPXSCL"] = np.std(res["PXSCL"])
         hdu.header["PA"] = np.mean(res["PA"])
         hdu.header["EPA"] = np.std(res["PA"])
+        if USER_OFF_ENABLED:
+            hdu.header["OFFANGLE"] = res_off[0]["OffAngle"]
+            hdu.header["OFFSCALE"] = res_off[0]["OffScale"]
 
-        table = Frame("WCS_fit_result.fits", "PROD", type=Frame.TYPE_TABLE)
+        table = Frame("WCS_fit_external.fits", "PROD", type=Frame.TYPE_TABLE)
         output_frames.append(table)
         output_frames[-1].write(hdu, overwrite=True)
+       
+        if drizzle:
+            drizzle_res = InternalMatch(FrameStore).refine()
+            out_cols = ["RA", "DEC"]
+        
+            res = np.recarray((len(frames),), dtype=[(col, float) for col in out_cols])
+
+            res["RA"] = drizzle_res["RA"]
+            res["DEC"] = drizzle_res["DEC"]
+
+            if USER_OFF_ENABLED:
+                print(user_off)
+                res_off = offset_analysis(FrameStore, user_off, origin)
+                res = rfn.append_fields(res, ["WCS_RA_OFF", "WCS_DEC_OFF", "USER_RA_OFF", "USER_DEC_OFF", "EST_RA_OFF", "EST_DEC_OFF"], 
+                        [res_off[1][:,0], res_off[1][:,1], user_off[:,0], user_off[:,1], res_off[2][:,0], res_off[2][:,1]])
+             
+            hdu = fits.BinTableHDU.from_columns(
+                    fits.ColDefs([fits.Column(name=col, array=res[col], format="D") for col in res.dtype.names]))
+            hdu.header["PXSCL"] = drizzle_res["pxscl"]
+            hdu.header["PA"] = drizzle_res["PA"]
+            if USER_OFF_ENABLED:
+                hdu.header["OFFANGLE"] = res_off[0]["OffAngle"]
+                hdu.header["OFFSCALE"] = res_off[0]["OffScale"]
+    
+            table = Frame("WCS_fit_drizzle.fits", "PROD", type=Frame.TYPE_TABLE)
+            output_frames.append(table)
+            output_frames[-1].write(hdu, overwrite=True)
+ 
+        for output, frame in zip(output_frames, FrameStore):
+            output.write(frame.hdul, overwrite=True)
 
         return output_frames
 
