@@ -17,9 +17,11 @@ import astropy.units as u
 import logging, sys, warnings
 import numpy.lib.recfunctions as rfn
 
-logging.basicConfig(format='[%(levelname)s] %(message)s', level=logging.INFO,
-                     stream=sys.stdout)
+logging.basicConfig(format='[{levelname:^7}] {module}: {message}', level=logging.INFO,
+                     stream=sys.stdout, style="{")
 logger = logging.getLogger(__name__)
+
+params = {}
 
 Vizier.ROW_LIMIT = -1
 #Vizier.SERVER = "http://vizier.cfa.harvard.edu/"
@@ -32,10 +34,10 @@ rotM = lambda ang : np.array([[np.cos(np.deg2rad(ang)), -np.sin(np.deg2rad(ang))
                                     [np.sin(np.deg2rad(ang)), np.cos(np.deg2rad(ang))]])
 
 def dict_params(input_params):
-    paramsd = {}
+    global params
     for i in range(len(input_params)):
-        paramsd[input_params[i].name] = input_params[i].value
-    return paramsd
+        params[input_params[i].name] = input_params[i].value
+    return params
 
 def wcs_sf(sources, ra_f, dec_f, ang, pxscl, sign):
 
@@ -95,8 +97,6 @@ def offset_analysis(frameStore, user_off, origin):
     mes_off = np.zeros([len(frameStore), 2])
     est_off = np.zeros([len(frameStore), 2])
 
-    print(mes_off.shape, est_off.shape, user_off.shape)
-
     for i, frame in enumerate(frameStore):
         wcs_t = frame.result
         if i == 0:
@@ -109,9 +109,6 @@ def offset_analysis(frameStore, user_off, origin):
 
     est_off = calc_off(out[0], mes_off)
         
-    print(out[0][0], out[0][1])
-    print(mes_off, est_off)
-
     return {"OffAngle" : out[0][0], "OffScale" : out[0][1]}, mes_off, est_off
 
 class GAIAProd:
@@ -119,15 +116,14 @@ class GAIAProd:
     gaia_cols = ["Source", "RA_ICRS", "e_RA_ICRS", "DE_ICRS", "e_DE_ICRS", "Gmag", "pmRA", "pmDE"]
     gaia_fmt = ["A30", "D", "D", "D", "D", "D", "D", "D"]
     
-    def __init__(self, coo, date, params):
+    def __init__(self, coo, date):
         self.coo = coo
         self.date = date
-        self.params = params
 
     def fetch_catalog(self, box_width, maglim):
 
-        maglim = self.params["gaia.maglim"]
-        prop_motion = self.params["gaia.prop_motion"]
+        maglim = params["gaia.maglim"]
+        prop_motion = params["gaia.prop_motion"]
 
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', AstropyWarning)
@@ -141,8 +137,8 @@ class GAIAProd:
 
     def mock_image(self, pa, pxscl, fov, sign):
 
-        zeromag = self.params["gaia.zeromag"]
-        fwhm = self.params["gaia.fwhm"]*1e3
+        zeromag = params["gaia.zeromag"]
+        fwhm = params["gaia.fwhm"]*1e3
 
         sz = np.int64(fov/pxscl)
         extnd = int(fwhm/pxscl*10)
@@ -191,7 +187,7 @@ class GAIAProd:
 
     def match_catalog(self, sources, it):
 
-        min_sep = self.params["gaia.min_separation"]
+        min_sep = params["gaia.min_separation"]
         if it > 0: min_sep /= 2.
 
         ndx_o = []
@@ -215,10 +211,9 @@ class NIXFrame(Frame):
 
     result = None
 
-    def __init__(self, frame, params):
+    def __init__(self, frame):
         logger.info("Processing : %s" % frame.filename)
         self.frame = frame
-        self.params = params
         self.hdul = self.frame.open()
         self.patch_wcs_if_needed()
         #self.setup_gaia()
@@ -279,14 +274,14 @@ class NIXFrame(Frame):
     def setup_gaia(self):
         header_xt0 = self.hdul[0].header
         header_xt1 = self.hdul[1].header
-        self.gaia_prod = GAIAProd(SkyCoord(header_xt1["CRVAL1"]*u.deg, header_xt1["CRVAL2"]*u.deg), self.hdul[0].header["MJD-OBS"], self.params)
+        self.gaia_prod = GAIAProd(SkyCoord(header_xt1["CRVAL1"]*u.deg, header_xt1["CRVAL2"]*u.deg), self.hdul[0].header["MJD-OBS"])
         # think about this bit
         self.gaia_prod.fetch_catalog(self.pxscl*2048*1.2e-3*np.sqrt(2)*u.arcsec, 20)
         self.gaia_prod.mock_image(self.PA, self.pxscl, self.pxscl*2048*1.2, self.sign)
 
     def discard_close(self, sources, it):
 
-        min_sep = self.params["sep.min_separation"]
+        min_sep = params["sep.min_separation"]
         if it > 0: min_sep /= 2.
 
         ndx = []
@@ -328,9 +323,9 @@ class NIXFrame(Frame):
 
     def extract_sources(self, it):
         
-        frame_cut = self.params["nix.frame_cut"]
-        sat_level = self.params["nix.saturation_level"]
-        thresh = self.params["sep.thresh"]
+        frame_cut = params["nix.frame_cut"]
+        sat_level = params["nix.saturation_level"]
+        thresh = params["sep.thresh"]
 
         image = self.hdul[1].data.byteswap().newbyteorder()
         err = self.hdul[2].data.byteswap().newbyteorder()
@@ -406,6 +401,8 @@ class NIXFrame(Frame):
 class InternalMatch:
 
     def __init__(self, FrameStore):
+        logging.info("Drizzling sources...")
+        
         self.FrameStore = FrameStore
         for frame in self.FrameStore:
             frame.extract_sources(1)
@@ -426,6 +423,7 @@ class InternalMatch:
         return matches
 
     def do_master_catalog(self):
+        
         self.catalog = []
 
         for i in range(len(self.FrameStore)-1):
@@ -435,8 +433,7 @@ class InternalMatch:
                     if len(matches) > 0:
                         self.catalog.append([[source["RA"], source["DEC"]], (i,j), *matches])
 
-        for i, source in enumerate(self.catalog):
-            self.err_sf(i)
+        logging.info("# of matched sources : %d" % len(self.catalog))
 
     def err_sf(self, ndx):
         matches = self.catalog[ndx][1:]
@@ -465,7 +462,6 @@ class InternalMatch:
 
     def refine(self):
 
-        logging.info("Drizzling sources...")
 
         pa = self.FrameStore[0].result["PA"]
         pxscl = self.FrameStore[0].result["pxscl"]
@@ -577,7 +573,7 @@ class TestRecipe(esorexplugin.RecipePlugin):
 
         output_frames = []
         for i, frame in enumerate(frames):
-            nxframe = NIXFrame(frame, params)
+            nxframe = NIXFrame(frame)
             res[i] = nxframe.process()
             FrameStore.append(nxframe)
             new_frame = Frame("%s" % nxframe.frame.filename.split("/")[-1], "PROD", type = Frame.TYPE_IMAGE)
@@ -612,7 +608,6 @@ class TestRecipe(esorexplugin.RecipePlugin):
             res["DEC"] = drizzle_res["DEC"]
 
             if USER_OFF_ENABLED:
-                print(user_off)
                 res_off = offset_analysis(FrameStore, user_off, origin)
                 res = rfn.append_fields(res, ["WCS_RA_OFF", "WCS_DEC_OFF", "USER_RA_OFF", "USER_DEC_OFF", "EST_RA_OFF", "EST_DEC_OFF"], 
                         [res_off[1][:,0], res_off[1][:,1], user_off[:,0], user_off[:,1], res_off[2][:,0], res_off[2][:,1]])
